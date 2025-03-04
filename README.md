@@ -91,8 +91,8 @@ Chat history is stored in the `chat_history` directory, with each conversation h
 
 ## License
 
-[Your chosen license]
+[MIT License](LICENSE)
 
 ## Contributing
 
-[Your contribution guidelines] 
+Fork it and do what you want - would appreciate a shoutout!
