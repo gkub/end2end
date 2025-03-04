@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sodium.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>  // For TCP_NODELAY
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <thread>
@@ -45,7 +46,7 @@ void handleError(const char* message) {
 bool sendAll(int socket, const void* data, size_t length) {
     const char* ptr = static_cast<const char*>(data);
     while (length > 0) {
-        ssize_t sent = send(socket, ptr, length, 0);
+        ssize_t sent = send(socket, ptr, length, MSG_NOSIGNAL);  // Use MSG_NOSIGNAL to prevent SIGPIPE
         if (sent <= 0) {
             if (errno == EINTR) continue;
             return false;
@@ -53,6 +54,13 @@ bool sendAll(int socket, const void* data, size_t length) {
         ptr += sent;
         length -= sent;
     }
+    
+    // Ensure the data is sent immediately
+    int flag = 1;
+    if (setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
+        std::cerr << "Warning: Failed to set TCP_NODELAY" << std::endl;
+    }
+    
     return true;
 }
 
@@ -140,8 +148,9 @@ void saveToChatHistory(const std::string& message, const UserKeyPair& myKeyPair,
             throw std::runtime_error("Failed to open history file");
         }
         
-        // Write prefix
-        historyFile << (isSent ? "Sent: " : "Received: ");
+        // Write message type (1 byte)
+        uint8_t messageType = isSent ? 1 : 0;
+        historyFile.write(reinterpret_cast<char*>(&messageType), sizeof(messageType));
         
         // Write nonce
         historyFile.write(reinterpret_cast<char*>(encryptedHistoryEntry.nonce), crypto_box_NONCEBYTES);
@@ -153,9 +162,6 @@ void saveToChatHistory(const std::string& message, const UserKeyPair& myKeyPair,
         // Write encrypted data
         historyFile.write(reinterpret_cast<char*>(encryptedHistoryEntry.cipherText.data()), 
                         encryptedHistoryEntry.cipherTextLength);
-        
-        // Write newline
-        historyFile << std::endl;
         
         if (!historyFile) {
             throw std::runtime_error("Failed to write to history file");
@@ -184,27 +190,28 @@ void displayChatHistory(const UserKeyPair& myKeyPair, const unsigned char* frien
     }
 
     try {
-        std::string line;
-        while (std::getline(historyFile, line)) {
-            if (line.empty()) continue;
-            
-            // Extract prefix (Sent: or Received:)
-            size_t prefixLength = line.find(": ") + 2;
-            if (prefixLength == 1) continue; // Invalid line format
+        while (historyFile) {
+            // Read message type
+            uint8_t messageType;
+            if (!historyFile.read(reinterpret_cast<char*>(&messageType), sizeof(messageType))) {
+                break;
+            }
             
             // Read nonce
             unsigned char nonce[crypto_box_NONCEBYTES];
-            historyFile.read(reinterpret_cast<char*>(nonce), crypto_box_NONCEBYTES);
+            if (!historyFile.read(reinterpret_cast<char*>(nonce), crypto_box_NONCEBYTES)) {
+                throw std::runtime_error("Failed to read nonce");
+            }
             
             // Read encrypted data length
             uint32_t dataLength;
-            historyFile.read(reinterpret_cast<char*>(&dataLength), sizeof(dataLength));
+            if (!historyFile.read(reinterpret_cast<char*>(&dataLength), sizeof(dataLength))) {
+                throw std::runtime_error("Failed to read data length");
+            }
             
             // Read encrypted data
             std::vector<unsigned char> encryptedData(dataLength);
-            historyFile.read(reinterpret_cast<char*>(encryptedData.data()), dataLength);
-            
-            if (historyFile.fail()) {
+            if (!historyFile.read(reinterpret_cast<char*>(encryptedData.data()), dataLength)) {
                 throw std::runtime_error("Failed to read encrypted data");
             }
             
@@ -216,7 +223,7 @@ void displayChatHistory(const UserKeyPair& myKeyPair, const unsigned char* frien
             
             // Decrypt and display
             std::string decryptedMessage = decryptMessage(historyEntry, myKeyPair.privateKey, friendPublicKey);
-            std::cout << line.substr(0, prefixLength) << decryptedMessage << std::endl;
+            std::cout << (messageType ? "Sent: " : "Received: ") << decryptedMessage << std::endl;
         }
     } catch (const std::exception& e) {
         std::cerr << "Error reading chat history: " << e.what() << std::endl;
@@ -267,8 +274,17 @@ void receiveMessages(int clientSocket, const UserKeyPair& myKeyPair,
             break;
         }
 
-        std::vector<unsigned char> receivedBuffer(receivedHeader.dataSize);
-        if (!recvAll(clientSocket, receivedBuffer.data(), receivedHeader.dataSize)) {
+        // Read nonce
+        unsigned char nonce[crypto_box_NONCEBYTES];
+        if (!recvAll(clientSocket, nonce, crypto_box_NONCEBYTES)) {
+            std::cout << "\nFailed to receive message nonce." << std::endl;
+            shouldExit = true;
+            break;
+        }
+
+        // Read encrypted data
+        std::vector<unsigned char> receivedBuffer(receivedHeader.dataSize - crypto_box_NONCEBYTES);
+        if (!recvAll(clientSocket, receivedBuffer.data(), receivedBuffer.size())) {
             std::cout << "\nFailed to receive complete message." << std::endl;
             shouldExit = true;
             break;
@@ -276,12 +292,9 @@ void receiveMessages(int clientSocket, const UserKeyPair& myKeyPair,
 
         try {
             EncryptedMessage receivedData;
-            std::memcpy(receivedData.nonce, receivedBuffer.data(), crypto_box_NONCEBYTES);
-            receivedData.cipherTextLength = receivedBuffer.size() - crypto_box_NONCEBYTES;
-            receivedData.cipherText.resize(receivedData.cipherTextLength);
-            std::memcpy(receivedData.cipherText.data(), 
-                       receivedBuffer.data() + crypto_box_NONCEBYTES, 
-                       receivedData.cipherTextLength);
+            std::memcpy(receivedData.nonce, nonce, crypto_box_NONCEBYTES);
+            receivedData.cipherTextLength = receivedBuffer.size();
+            receivedData.cipherText = receivedBuffer;
 
             std::string decryptedContent = decryptMessage(receivedData, myKeyPair.privateKey, friendPublicKey);
             
@@ -413,6 +426,12 @@ int main() {
                 if (!sendAll(clientSocketDescriptor, encryptedMessage.cipherText.data(), 
                             encryptedMessage.cipherTextLength)) {
                     throw std::runtime_error("Failed to send message data");
+                }
+
+                // Flush the socket to ensure immediate delivery
+                int flag = 1;
+                if (setsockopt(clientSocketDescriptor, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
+                    std::cerr << "Warning: Failed to set TCP_NODELAY" << std::endl;
                 }
 
                 saveToChatHistory(input, myKeyPair, friendPublicKey, true);
