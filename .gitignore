@@ -1,0 +1,4 @@
+relay
+chat
+*.o
+chat_history*
