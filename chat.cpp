@@ -14,7 +14,7 @@
 #define MESSAGE_BUFFER_SIZE 2048
 #define RELAY_PORT 5555
 #define FILE_CHUNK_SIZE 1024 // Size of file chunks to send
-#define HISTORY_FILE_PREFIX "chat_history_"
+#define HISTORY_FILE_PREFIX "chat_history/"
 
 // User key pair structure for encryption
 struct UserKeyPair {
@@ -126,7 +126,6 @@ void saveToChatHistory(const std::string& message, const UserKeyPair& myKeyPair,
     unsigned char hashedFriendKey[crypto_hash_sha256_BYTES];
     crypto_hash_sha256(hashedFriendKey, friendPublicKey, crypto_box_PUBLICKEYBYTES);
     
-    // Allocate space for hex string (2 chars per byte + null terminator)
     char hexString[crypto_hash_sha256_BYTES * 2 + 1];
     sodium_bin2hex(hexString, sizeof(hexString), hashedFriendKey, sizeof(hashedFriendKey));
     
@@ -141,11 +140,26 @@ void saveToChatHistory(const std::string& message, const UserKeyPair& myKeyPair,
             throw std::runtime_error("Failed to open history file");
         }
         
+        // Write prefix
         historyFile << (isSent ? "Sent: " : "Received: ");
+        
+        // Write nonce
         historyFile.write(reinterpret_cast<char*>(encryptedHistoryEntry.nonce), crypto_box_NONCEBYTES);
+        
+        // Write encrypted data length (4 bytes)
+        uint32_t dataLength = encryptedHistoryEntry.cipherTextLength;
+        historyFile.write(reinterpret_cast<char*>(&dataLength), sizeof(dataLength));
+        
+        // Write encrypted data
         historyFile.write(reinterpret_cast<char*>(encryptedHistoryEntry.cipherText.data()), 
                         encryptedHistoryEntry.cipherTextLength);
+        
+        // Write newline
         historyFile << std::endl;
+        
+        if (!historyFile) {
+            throw std::runtime_error("Failed to write to history file");
+        }
     } catch (const std::exception& e) {
         std::cerr << "Failed to save chat history: " << e.what() << std::endl;
     }
@@ -182,19 +196,22 @@ void displayChatHistory(const UserKeyPair& myKeyPair, const unsigned char* frien
             unsigned char nonce[crypto_box_NONCEBYTES];
             historyFile.read(reinterpret_cast<char*>(nonce), crypto_box_NONCEBYTES);
             
-            // Read encrypted data
-            std::vector<unsigned char> encryptedData;
-            char byte;
-            while (historyFile.get(byte) && byte != '\n') {
-                encryptedData.push_back(static_cast<unsigned char>(byte));
-            }
+            // Read encrypted data length
+            uint32_t dataLength;
+            historyFile.read(reinterpret_cast<char*>(&dataLength), sizeof(dataLength));
             
-            if (encryptedData.empty()) continue;
+            // Read encrypted data
+            std::vector<unsigned char> encryptedData(dataLength);
+            historyFile.read(reinterpret_cast<char*>(encryptedData.data()), dataLength);
+            
+            if (historyFile.fail()) {
+                throw std::runtime_error("Failed to read encrypted data");
+            }
             
             // Create encrypted message structure
             EncryptedMessage historyEntry;
             std::memcpy(historyEntry.nonce, nonce, crypto_box_NONCEBYTES);
-            historyEntry.cipherTextLength = encryptedData.size();
+            historyEntry.cipherTextLength = dataLength;
             historyEntry.cipherText = encryptedData;
             
             // Decrypt and display
@@ -260,7 +277,7 @@ void receiveMessages(int clientSocket, const UserKeyPair& myKeyPair,
         try {
             EncryptedMessage receivedData;
             std::memcpy(receivedData.nonce, receivedBuffer.data(), crypto_box_NONCEBYTES);
-            receivedData.cipherTextLength = receivedHeader.dataSize - crypto_box_NONCEBYTES;
+            receivedData.cipherTextLength = receivedBuffer.size() - crypto_box_NONCEBYTES;
             receivedData.cipherText.resize(receivedData.cipherTextLength);
             std::memcpy(receivedData.cipherText.data(), 
                        receivedBuffer.data() + crypto_box_NONCEBYTES, 
