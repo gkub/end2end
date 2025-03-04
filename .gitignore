@@ -1,5 +1,5 @@
 relay
 chat
 *.o
-chat_history/
+chat_history/*
 chat_history_*
