@@ -1,6 +1,6 @@
-# End-to-End Encrypted Chat Application
+# End-to-End Encrypted Chat/Filesharing Application
 
-A secure, end-to-end encrypted chat application built in C++ that uses libsodium for encryption and a relay server for message delivery.
+Free + open source end-to-end chat app. Don't trust it, it's not done.
 
 ## Features
 
