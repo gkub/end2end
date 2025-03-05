@@ -1,3 +1,9 @@
+// chat.cpp
+// This is a simple chat client that uses end-to-end encryption and authentication.
+
+// Gregory Kubiski-Moshansky
+// 2025-03-05
+
 #include <iostream>
 #include <vector>
 #include <string>
