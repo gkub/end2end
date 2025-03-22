@@ -167,6 +167,68 @@ void checkAndSendHeartbeats(std::vector<Client>& clients) {
     }
 }
 
+// Helper function to display available commands
+void displayHelp() {
+    std::cout << "\n\033[1;36m--- Available Commands ---\033[0m\n";
+    std::cout << "\033[1;33m/help\033[0m    - Display this help message\n";
+    std::cout << "\033[1;33m/status\033[0m  - Check connection status of clients\n";
+    std::cout << "\033[1;33m/quit\033[0m    - Shut down the relay server\n";
+    std::cout << "\033[1;33m/clients\033[0m - Show connected clients\n\n";
+}
+
+// Helper function to display client status
+void displayClientStatus(const std::vector<Client>& clients) {
+    std::cout << "\n\033[1;36m--- Client Status ---\033[0m\n";
+    
+    int connectedCount = 0;
+    for (size_t i = 0; i < clients.size(); i++) {
+        const auto& client = clients[i];
+        if (client.connected) {
+            connectedCount++;
+            auto now = std::chrono::steady_clock::now();
+            auto lastHeartbeat = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - client.lastHeartbeatReceived).count();
+                
+            std::cout << "Client " << i + 1 << ": \033[1;32mConnected\033[0m";
+            std::cout << " (Last heartbeat: " << lastHeartbeat << "ms ago)\n";
+        } else {
+            std::cout << "Client " << i + 1 << ": \033[1;31mDisconnected\033[0m\n";
+        }
+    }
+    
+    std::cout << "\nTotal: " << connectedCount << "/" << clients.size() << " clients connected\n\n";
+}
+
+// Helper function to display connected clients
+void displayConnectedClients(const std::vector<Client>& clients) {
+    std::cout << "\n\033[1;36m--- Connected Clients ---\033[0m\n";
+    
+    int connectedCount = 0;
+    for (size_t i = 0; i < clients.size(); i++) {
+        if (clients[i].connected) {
+            connectedCount++;
+            struct sockaddr_in addr;
+            socklen_t addrLen = sizeof(addr);
+            
+            if (getpeername(clients[i].socket, (struct sockaddr*)&addr, &addrLen) == 0) {
+                char ipBuffer[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr.sin_addr, ipBuffer, sizeof(ipBuffer));
+                std::cout << "Client " << i + 1 << ": \033[1;32mConnected\033[0m - " << ipBuffer << ":" << ntohs(addr.sin_port) << "\n";
+            } else {
+                std::cout << "Client " << i + 1 << ": \033[1;32mConnected\033[0m\n";
+            }
+        } else {
+            std::cout << "Client " << i + 1 << ": \033[1;31mDisconnected\033[0m\n";
+        }
+    }
+    
+    if (connectedCount == 0) {
+        std::cout << "No clients connected\n";
+    }
+    
+    std::cout << std::endl;
+}
+
 int main() {
     // Set up signal handlers
     signal(SIGINT, signalHandler);
@@ -223,6 +285,7 @@ int main() {
         return 1;
     }
     std::cout << "Relay server listening on port " << RELAY_PORT << "..." << std::endl;
+    std::cout << "Available commands: /help, /status, /quit, /clients" << std::endl;
 
     // Store connected clients
     std::vector<Client> clients(MAX_CLIENTS);
@@ -409,6 +472,34 @@ int main() {
             if (allDisconnected) {
                 std::cout << "All clients disconnected. Shutting down." << std::endl;
                 break;
+            }
+        }
+
+        // Check for user input without blocking
+        struct timeval inputTimeout;
+        inputTimeout.tv_sec = 0;
+        inputTimeout.tv_usec = 10000; // 10ms - very short timeout to prevent hang
+        
+        fd_set inputfds;
+        FD_ZERO(&inputfds);
+        FD_SET(STDIN_FILENO, &inputfds);
+        
+        if (select(STDIN_FILENO + 1, &inputfds, nullptr, nullptr, &inputTimeout) > 0) {
+            std::string command;
+            if (std::getline(std::cin, command)) {
+                if (command == "/quit") {
+                    std::cout << "Shutting down relay server..." << std::endl;
+                    g_shouldExit = true;
+                    break;
+                } else if (command == "/help") {
+                    displayHelp();
+                } else if (command == "/status") {
+                    displayClientStatus(clients);
+                } else if (command == "/clients") {
+                    displayConnectedClients(clients);
+                } else if (!command.empty()) {
+                    std::cout << "Unknown command. Type /help for available commands." << std::endl;
+                }
             }
         }
     }

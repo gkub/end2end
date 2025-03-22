@@ -324,9 +324,18 @@ std::string getTimestamp() {
 
 // Helper function to print a message with timestamp
 void printMessage(const std::string& prefix, const std::string& message) {
+    std::string colorCode;
+    if (prefix == "You:") {
+        colorCode = "\033[1;36m"; // Cyan for "You"
+    } else if (prefix == "Friend:") {
+        colorCode = "\033[1;32m"; // Green for "Friend"
+    } else {
+        colorCode = "\033[1;33m"; // Yellow for other messages
+    }
+    
     std::cout << "\r\033[K"  // Clear current line
-              << "\033[1;34m" << getTimestamp() << "\033[0m "  // Timestamp in blue
-              << "\033[1;32m" << prefix << "\033[0m "  // Prefix in green
+              << "\033[1;35m" << getTimestamp() << "\033[0m "  // Timestamp in magenta
+              << colorCode << prefix << "\033[0m "  // Prefix in different colors depending on who is speaking
               << message << std::endl;  // Don't show prompt here
 }
 
@@ -352,8 +361,21 @@ void displayPrompt(const std::string& currentInput) {
     
     std::cout << "\033[1;36mYou: \033[0m"  // Prompt in cyan
               << currentInput  // Current input
-              << "\033[5m|\033[0m"  // Blinking cursor
               << std::flush;
+}
+
+// Helper function to display available commands
+void displayHelp() {
+    std::cout << "\n\033[1;36m--- Available Commands ---\033[0m\n";
+    std::cout << "\033[1;33m/help\033[0m    - Display this help message\n";
+    std::cout << "\033[1;33m/exit\033[0m    - Exit the chat program\n";
+    std::cout << "\033[1;33m/history\033[0m - Display encrypted chat history\n";
+    std::cout << "\033[1;33m/file <path>\033[0m - Send a file to your chat partner\n";
+    std::cout << "\033[1;33m/status\033[0m  - Check connection status with relay server\n";
+    std::cout << "\n\033[1;36m--- Connection Status Indicators ---\033[0m\n";
+    std::cout << "\033[1;31m[!]\033[0m - Connection warning (no response for 5+ seconds)\n";
+    std::cout << "\033[1;31m[X]\033[0m - Connection lost\n";
+    std::cout << "\033[1;32m[✓]\033[0m - Connection restored\n\n";
 }
 
 // Thread for sending heartbeats and checking connection status
@@ -800,6 +822,7 @@ int main() {
         }
 
         std::cout << "Connected to relay server at " << relayServerIP << ":" << RELAY_PORT << std::endl;
+        std::cout << "Type a message and press Enter to send. Type /help to see available commands." << std::endl;
 
         // Start three threads: message receiver, connection manager, and message sender
         std::thread receiverThread(receiveMessages, clientSocketDescriptor, myKeyPair, friendPublicKey);
@@ -871,6 +894,10 @@ int main() {
                                 break;
                             } else if (input == "/history") {
                                 displayChatHistory(myKeyPair, friendPublicKey);
+                                displayPrompt("");
+                                continue;
+                            } else if (input == "/help") {
+                                displayHelp();
                                 displayPrompt("");
                                 continue;
                             } else if (input.substr(0, 5) == "/file ") {
