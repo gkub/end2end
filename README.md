@@ -8,7 +8,7 @@ Free + open source end-to-end encrypted chat application with secure file sharin
 -   Secure key exchange
 -   Real-time file transfer capability
 -   Persistent encrypted chat history
--   Interactive command-line interface with live typing display
+-   Interactive command-line interface with color-coded messages
 -   Robust connection management with automatic reconnection
 -   Connection status monitoring with visual feedback
 -   Graceful handling of disconnections and server shutdowns
@@ -86,12 +86,16 @@ This will create two executables:
 
 -   `/help` - Display all available commands
 -   `/status` - Check connection status of clients
--   `/clients` - Show connected clients
+-   `/clients` - Show connected clients with IP addresses
 -   `/quit` - Shut down the relay server
 
 ## Chat Interface
 
--   A blinking cursor indicates your current typing position
+-   Color-coded messages:
+    -   Your messages appear in cyan
+    -   Friend's messages appear in green
+    -   System messages appear in yellow/red
+    -   Timestamps appear in magenta
 -   Status indicators appear when connection issues are detected
 -   Countdown timer displays when connection is lost
 -   Messages are queued during disconnections and sent when connection is restored
