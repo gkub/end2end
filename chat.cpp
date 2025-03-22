@@ -3,6 +3,7 @@
 #include <string>
 #include <cstring>
 #include <fstream>
+#include <sstream>  // Add this for std::ostringstream
 #include <sodium.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>  // For TCP_NODELAY
@@ -11,11 +12,23 @@
 #include <thread>
 #include <atomic>
 #include <errno.h>
+#include <fcntl.h>
+#include <iomanip>
+#include <ctime>
+#include <sys/select.h>
+#include <termios.h>  // For terminal control
+#include <mutex>
+#include <signal.h>
+#include <queue>
+#include <chrono>
 
 #define MESSAGE_BUFFER_SIZE 2048
 #define RELAY_PORT 5555
 #define FILE_CHUNK_SIZE 1024 // Size of file chunks to send
 #define HISTORY_FILE_PREFIX "chat_history/"
+#define HEARTBEAT_INTERVAL_MS 500 // Send heartbeat every 500ms
+#define CONNECTION_TIMEOUT_MS 5000 // Warn after 5 seconds of no response
+#define SHUTDOWN_TIMER_MS 10000 // Wait additional 10 seconds before shutdown
 
 // User key pair structure for encryption
 struct UserKeyPair {
@@ -32,10 +45,24 @@ struct EncryptedMessage {
 
 // Header to distinguish message types
 struct TransferHeader {
-    char type[4]; // "MSG" for message, "FIL" for file
+    char type[4]; // "MSG" for message, "FIL" for file, "HBT" for heartbeat
     size_t dataSize; // Size of the following encrypted data
     char fileName[256]; // File name (if type is "FIL"), zeroed for messages
 };
+
+// Global variables for thread communication
+std::atomic<bool> shouldExit(false);
+std::string currentInput;
+std::mutex inputMutex;
+std::queue<std::string> messageQueue;
+std::mutex queueMutex;
+
+// Connection state tracking
+std::atomic<bool> connectionLost(false);
+std::atomic<bool> inCountdownMode(false);
+std::atomic<int> countdownSeconds(0);
+std::chrono::time_point<std::chrono::steady_clock> lastHeartbeatReceived;
+std::chrono::time_point<std::chrono::steady_clock> connectionLostTime;
 
 // Helper function to handle errors
 void handleError(const char* message) {
@@ -71,12 +98,38 @@ bool recvAll(int socket, void* data, size_t length) {
         ssize_t received = recv(socket, ptr, length, 0);
         if (received <= 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Wait for socket to become readable
+                fd_set readfds;
+                FD_ZERO(&readfds);
+                FD_SET(socket, &readfds);
+                
+                // Use a short timeout to avoid blocking forever
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 250000; // 250ms timeout
+                
+                if (select(socket + 1, &readfds, nullptr, nullptr, &tv) <= 0) {
+                    return false;
+                }
+                continue;
+            }
             return false;
         }
         ptr += received;
         length -= received;
     }
     return true;
+}
+
+// Helper function to send a heartbeat
+bool sendHeartbeat(int socket) {
+    TransferHeader heartbeatHeader;
+    std::memset(&heartbeatHeader, 0, sizeof(heartbeatHeader));
+    strncpy(heartbeatHeader.type, "HBT", sizeof(heartbeatHeader.type));
+    heartbeatHeader.dataSize = 0;
+
+    return sendAll(socket, &heartbeatHeader, sizeof(heartbeatHeader));
 }
 
 // Generate a key pair for the user
@@ -260,62 +313,370 @@ void sendFile(int clientSocket, const std::string& filePath, const UserKeyPair& 
     std::cout << "File sent: " << filePath << std::endl;
 }
 
-// Global flag for graceful shutdown
-std::atomic<bool> shouldExit(false);
+// Helper function to get current timestamp
+std::string getTimestamp() {
+    auto now = std::time(nullptr);
+    auto tm = *std::localtime(&now);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    return oss.str();
+}
+
+// Helper function to print a message with timestamp
+void printMessage(const std::string& prefix, const std::string& message) {
+    std::cout << "\r\033[K"  // Clear current line
+              << "\033[1;34m" << getTimestamp() << "\033[0m "  // Timestamp in blue
+              << "\033[1;32m" << prefix << "\033[0m "  // Prefix in green
+              << message << std::endl;  // Don't show prompt here
+}
+
+// Helper function to print a system message
+void printSystemMessage(const std::string& message, bool isWarning = false) {
+    std::cout << "\r\033[K"  // Clear current line
+              << "\033[1;34m" << getTimestamp() << "\033[0m "  // Timestamp in blue
+              << (isWarning ? "\033[1;31m" : "\033[1;33m") << "SYSTEM: " << "\033[0m "  // System in yellow or red
+              << message << std::endl;  // Don't show prompt here
+}
+
+// Helper function to display the input prompt
+void displayPrompt(const std::string& currentInput) {
+    std::cout << "\r\033[K";  // Clear current line
+    
+    // Show countdown if active
+    if (inCountdownMode) {
+        std::cout << "\033[1;31m[Disconnected - Closing in " << countdownSeconds 
+                  << "s] \033[0m";
+    } else if (connectionLost) {
+        std::cout << "\033[1;33m[Connection Lost] \033[0m";
+    }
+    
+    std::cout << "\033[1;36mYou: \033[0m"  // Prompt in cyan
+              << currentInput  // Current input
+              << "\033[5m|\033[0m"  // Blinking cursor
+              << std::flush;
+}
+
+// Thread for sending heartbeats and checking connection status
+void connectionManager(int clientSocket) {
+    // Initialize last heartbeat time to now
+    lastHeartbeatReceived = std::chrono::steady_clock::now();
+    
+    while (!shouldExit) {
+        // Send heartbeat every HEARTBEAT_INTERVAL_MS
+        if (sendHeartbeat(clientSocket)) {
+            // Heartbeat sent successfully
+        } else {
+            if (!connectionLost) {
+                connectionLost = true;
+                connectionLostTime = std::chrono::steady_clock::now();
+                printSystemMessage("Connection to relay server lost. Waiting for reconnection...", true);
+                
+                // Lock to update display
+                {
+                    std::lock_guard<std::mutex> lock(inputMutex);
+                    displayPrompt(currentInput);
+                }
+            }
+        }
+        
+        // Check if connection is lost and manage countdown
+        auto now = std::chrono::steady_clock::now();
+        if (connectionLost) {
+            auto disconnectedTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - connectionLostTime).count();
+                
+            if (!inCountdownMode && disconnectedTime > CONNECTION_TIMEOUT_MS) {
+                // Start countdown after timeout
+                inCountdownMode = true;
+                countdownSeconds = SHUTDOWN_TIMER_MS / 1000;
+                printSystemMessage("No response from relay server. Chat will close in " + 
+                                 std::to_string(countdownSeconds) + " seconds if connection is not restored.", true);
+                
+                // Lock to update display
+                {
+                    std::lock_guard<std::mutex> lock(inputMutex);
+                    displayPrompt(currentInput);
+                }
+            }
+            else if (inCountdownMode) {
+                // Update countdown every second
+                int newSeconds = (CONNECTION_TIMEOUT_MS + SHUTDOWN_TIMER_MS - disconnectedTime) / 1000;
+                if (newSeconds < countdownSeconds) {
+                    countdownSeconds = newSeconds;
+                    
+                    // Lock to update display
+                    {
+                        std::lock_guard<std::mutex> lock(inputMutex);
+                        displayPrompt(currentInput);
+                    }
+                    
+                    // Remind user every 3 seconds
+                    if (countdownSeconds % 3 == 0) {
+                        printSystemMessage("Connection still lost. Closing in " + 
+                                         std::to_string(countdownSeconds) + " seconds...", true);
+                    }
+                    
+                    // Time's up - signal main thread to exit
+                    if (countdownSeconds <= 0) {
+                        printSystemMessage("Connection timeout. Closing chat client...", true);
+                        shouldExit = true;
+                        kill(getpid(), SIGUSR1); // Signal main thread
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Check for heartbeat timeout
+        auto heartbeatAge = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - lastHeartbeatReceived).count();
+        if (!connectionLost && heartbeatAge > CONNECTION_TIMEOUT_MS) {
+            connectionLost = true;
+            connectionLostTime = now;
+            printSystemMessage("No heartbeat from relay server. Waiting for response...", true);
+            
+            // Lock to update display
+            {
+                std::lock_guard<std::mutex> lock(inputMutex);
+                displayPrompt(currentInput);
+            }
+        }
+        
+        // Sleep before next heartbeat
+        std::this_thread::sleep_for(std::chrono::milliseconds(HEARTBEAT_INTERVAL_MS));
+    }
+}
+
+// Message send thread to handle queued messages
+void messageSender(int clientSocket, const UserKeyPair& myKeyPair, const unsigned char* friendPublicKey) {
+    while (!shouldExit) {
+        std::string message;
+        bool hasMessage = false;
+        
+        // Check for queued messages
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (!messageQueue.empty()) {
+                message = messageQueue.front();
+                messageQueue.pop();
+                hasMessage = true;
+            }
+        }
+        
+        if (hasMessage && !connectionLost) {
+            try {
+                EncryptedMessage encryptedMessage = encryptMessage(message, myKeyPair.privateKey, friendPublicKey);
+                TransferHeader header;
+                std::memset(&header, 0, sizeof(header));
+                strncpy(header.type, "MSG", sizeof(header.type));
+                header.dataSize = encryptedMessage.cipherTextLength + crypto_box_NONCEBYTES;
+
+                // Send header first
+                if (!sendAll(clientSocket, &header, sizeof(header))) {
+                    throw std::runtime_error("Failed to send message header - relay server disconnected");
+                }
+
+                // Send nonce
+                if (!sendAll(clientSocket, encryptedMessage.nonce, crypto_box_NONCEBYTES)) {
+                    throw std::runtime_error("Failed to send message nonce - relay server disconnected");
+                }
+
+                // Send encrypted data
+                if (!sendAll(clientSocket, encryptedMessage.cipherText.data(), 
+                            encryptedMessage.cipherTextLength)) {
+                    throw std::runtime_error("Failed to send message data - relay server disconnected");
+                }
+
+                saveToChatHistory(message, myKeyPair, friendPublicKey, true);
+                printMessage("You:", message);
+                
+                // Update display prompt
+                {
+                    std::lock_guard<std::mutex> lock(inputMutex);
+                    displayPrompt(currentInput);
+                }
+            } catch (const std::exception& e) {
+                std::string errorMsg = e.what();
+                std::cerr << "\033[1;31mError sending message: " << errorMsg << "\033[0m" << std::endl;
+                
+                // Requeue the message
+                {
+                    std::lock_guard<std::mutex> lock(queueMutex);
+                    messageQueue.push(message);
+                }
+                
+                // Message could not be sent
+                if (!connectionLost) {
+                    connectionLost = true;
+                    connectionLostTime = std::chrono::steady_clock::now();
+                    printSystemMessage("Failed to send message. Connection to relay server lost.", true);
+                    
+                    // Lock to update display
+                    {
+                        std::lock_guard<std::mutex> lock(inputMutex);
+                        displayPrompt(currentInput);
+                    }
+                }
+            }
+        }
+        
+        // Sleep briefly to avoid CPU spinning
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
 
 // Receive messages or files in a separate thread
 void receiveMessages(int clientSocket, const UserKeyPair& myKeyPair, 
                     const unsigned char* friendPublicKey) {
     while (!shouldExit) {
-        TransferHeader receivedHeader;
-        if (!recvAll(clientSocket, &receivedHeader, sizeof(receivedHeader))) {
-            std::cout << "\nDisconnected from relay server." << std::endl;
-            shouldExit = true;
-            break;
-        }
-
-        // Read nonce
-        unsigned char nonce[crypto_box_NONCEBYTES];
-        if (!recvAll(clientSocket, nonce, crypto_box_NONCEBYTES)) {
-            std::cout << "\nFailed to receive message nonce." << std::endl;
-            shouldExit = true;
-            break;
-        }
-
-        // Read encrypted data
-        std::vector<unsigned char> receivedBuffer(receivedHeader.dataSize - crypto_box_NONCEBYTES);
-        if (!recvAll(clientSocket, receivedBuffer.data(), receivedBuffer.size())) {
-            std::cout << "\nFailed to receive complete message." << std::endl;
-            shouldExit = true;
-            break;
-        }
-
-        try {
-            EncryptedMessage receivedData;
-            std::memcpy(receivedData.nonce, nonce, crypto_box_NONCEBYTES);
-            receivedData.cipherTextLength = receivedBuffer.size();
-            receivedData.cipherText = receivedBuffer;
-
-            std::string decryptedContent = decryptMessage(receivedData, myKeyPair.privateKey, friendPublicKey);
-            
-            if (strncmp(receivedHeader.type, "MSG", 3) == 0) {
-                std::cout << "\nFriend: " << decryptedContent << std::endl;
-                saveToChatHistory(decryptedContent, myKeyPair, friendPublicKey, false);
-            } else if (strncmp(receivedHeader.type, "FIL", 3) == 0) {
-                std::string outputFileName = std::string("received_") + receivedHeader.fileName;
-                std::ofstream outputFile(outputFileName, std::ios::app | std::ios::binary);
-                if (!outputFile) {
-                    throw std::runtime_error("Failed to open output file");
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(clientSocket, &readfds);
+        
+        // Set short timeout for select
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms
+        
+        int activity = select(clientSocket + 1, &readfds, NULL, NULL, &tv);
+        
+        if (activity < 0) {
+            if (!connectionLost) {
+                connectionLost = true;
+                connectionLostTime = std::chrono::steady_clock::now();
+                printSystemMessage("Connection error. Waiting for reconnection...", true);
+                
+                // Lock to update display
+                {
+                    std::lock_guard<std::mutex> lock(inputMutex);
+                    displayPrompt(currentInput);
                 }
-                outputFile.write(decryptedContent.c_str(), decryptedContent.size());
-                std::cout << "\nReceived file chunk for: " << outputFileName << std::endl;
             }
-        } catch (const std::exception& e) {
-            std::cerr << "\nError processing received data: " << e.what() << std::endl;
+            continue;
         }
         
-        std::cout << "You: ";
-        std::flush(std::cout);
+        if (activity == 0) continue; // No activity, just check again
+        
+        if (FD_ISSET(clientSocket, &readfds)) {
+            TransferHeader receivedHeader;
+            if (!recvAll(clientSocket, &receivedHeader, sizeof(receivedHeader))) {
+                // Connection lost
+                if (!connectionLost) {
+                    connectionLost = true;
+                    connectionLostTime = std::chrono::steady_clock::now();
+                    printSystemMessage("Connection to relay server lost. Waiting for reconnection...", true);
+                    
+                    // Lock to update display
+                    {
+                        std::lock_guard<std::mutex> lock(inputMutex);
+                        displayPrompt(currentInput);
+                    }
+                }
+                continue;
+            }
+            
+            // Connection restored if we get here
+            if (connectionLost) {
+                connectionLost = false;
+                inCountdownMode = false;
+                printSystemMessage("Connection to relay server restored!");
+                
+                // Lock to update display
+                {
+                    std::lock_guard<std::mutex> lock(inputMutex);
+                    displayPrompt(currentInput);
+                }
+            }
+            
+            // Update last heartbeat time
+            lastHeartbeatReceived = std::chrono::steady_clock::now();
+            
+            // Check for shutdown message (all zeros in type field)
+            if (receivedHeader.type[0] == 0 && receivedHeader.type[1] == 0 && 
+                receivedHeader.type[2] == 0 && receivedHeader.type[3] == 0) {
+                printSystemMessage("Relay server is shutting down. Chat session ended.", true);
+                kill(getpid(), SIGUSR1);
+                shouldExit = true;
+                break;
+            }
+            
+            // Check for heartbeat
+            if (strncmp(receivedHeader.type, "HBT", 3) == 0) {
+                // Just update last heartbeat time and continue
+                continue;
+            }
+            
+            // Handle regular message or file
+            // Read nonce
+            unsigned char nonce[crypto_box_NONCEBYTES];
+            if (!recvAll(clientSocket, nonce, crypto_box_NONCEBYTES)) {
+                if (!connectionLost) {
+                    connectionLost = true;
+                    connectionLostTime = std::chrono::steady_clock::now();
+                    printSystemMessage("Connection lost during message transfer. Waiting for reconnection...", true);
+                    
+                    // Lock to update display
+                    {
+                        std::lock_guard<std::mutex> lock(inputMutex);
+                        displayPrompt(currentInput);
+                    }
+                }
+                continue;
+            }
+            
+            // Read encrypted data
+            std::vector<unsigned char> receivedBuffer(receivedHeader.dataSize - crypto_box_NONCEBYTES);
+            if (!recvAll(clientSocket, receivedBuffer.data(), receivedBuffer.size())) {
+                if (!connectionLost) {
+                    connectionLost = true;
+                    connectionLostTime = std::chrono::steady_clock::now();
+                    printSystemMessage("Connection lost during message transfer. Waiting for reconnection...", true);
+                    
+                    // Lock to update display
+                    {
+                        std::lock_guard<std::mutex> lock(inputMutex);
+                        displayPrompt(currentInput);
+                    }
+                }
+                continue;
+            }
+            
+            try {
+                EncryptedMessage receivedData;
+                std::memcpy(receivedData.nonce, nonce, crypto_box_NONCEBYTES);
+                receivedData.cipherTextLength = receivedBuffer.size();
+                receivedData.cipherText = receivedBuffer;
+                
+                std::string decryptedContent = decryptMessage(receivedData, myKeyPair.privateKey, friendPublicKey);
+                
+                // Get a copy of the current input text
+                std::string inputCopy;
+                {
+                    std::lock_guard<std::mutex> lock(inputMutex);
+                    inputCopy = currentInput;
+                }
+                
+                printMessage("Friend:", decryptedContent);
+                
+                if (strncmp(receivedHeader.type, "MSG", 3) == 0) {
+                    saveToChatHistory(decryptedContent, myKeyPair, friendPublicKey, false);
+                } else if (strncmp(receivedHeader.type, "FIL", 3) == 0) {
+                    std::string outputFileName = std::string("received_") + receivedHeader.fileName;
+                    std::ofstream outputFile(outputFileName, std::ios::app | std::ios::binary);
+                    if (!outputFile) {
+                        throw std::runtime_error("Failed to open output file");
+                    }
+                    outputFile.write(decryptedContent.c_str(), decryptedContent.size());
+                    printSystemMessage("Received file chunk for: " + outputFileName);
+                }
+                
+                // Re-display prompt with current input text
+                displayPrompt(inputCopy);
+            } catch (const std::exception& e) {
+                std::cerr << "\n\033[1;31mError processing received data: " << e.what() << "\033[0m" << std::endl;
+                displayPrompt("");
+            }
+        }
     }
 }
 
@@ -326,8 +687,25 @@ std::string publicKeyToHex(const unsigned char* publicKey) {
     return std::string(hexString);
 }
 
+// Signal handler to handle immediate exits
+void signalHandler(int signum) {
+    (void)signum; // Suppress unused parameter warning
+    // Just a wake-up call, no action needed
+}
+
 int main() {
     try {
+        // Set up signal handler for SIGUSR1
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = signalHandler;
+        sigaction(SIGUSR1, &sa, NULL);
+        
+        // Save original terminal settings
+        struct termios oldt, newt;
+        tcgetattr(STDIN_FILENO, &oldt);
+        newt = oldt;
+        
         UserKeyPair myKeyPair;
         generateUserKeyPair(myKeyPair);
 
@@ -337,7 +715,8 @@ int main() {
                   << "Commands:\n"
                   << "  /exit     - Exit the program\n"
                   << "  /history  - Display chat history\n"
-                  << "  /file     - Send a file (usage: /file <path>)\n\n"
+                  << "  /file     - Send a file (usage: /file <path>)\n"
+                  << "  /status   - Check connection status\n\n"
                   << "Enter friend's public key (as hex, " << crypto_box_PUBLICKEYBYTES << " bytes): ";
 
         // Input friend's public key
@@ -359,6 +738,43 @@ int main() {
             throw std::runtime_error("Failed to create socket");
         }
 
+        // Set socket options for immediate delivery
+        int flag = 1;
+        if (setsockopt(clientSocketDescriptor, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
+            std::cerr << "Warning: Failed to set TCP_NODELAY" << std::endl;
+        }
+        
+        // Enable TCP keepalive
+        if (setsockopt(clientSocketDescriptor, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag)) < 0) {
+            std::cerr << "Warning: Failed to enable TCP keepalive" << std::endl;
+        }
+        
+#ifdef __linux__
+        // Linux-specific keepalive settings for faster disconnection detection
+        int keepalive_time = 1; // Start sending keepalive probes after 1 second of idle
+        if (setsockopt(clientSocketDescriptor, IPPROTO_TCP, TCP_KEEPIDLE, &keepalive_time, sizeof(keepalive_time)) < 0) {
+            std::cerr << "Warning: Failed to set TCP_KEEPIDLE" << std::endl;
+        }
+        
+        int keepalive_intvl = 1; // Send keepalive probe every 1 second
+        if (setsockopt(clientSocketDescriptor, IPPROTO_TCP, TCP_KEEPINTVL, &keepalive_intvl, sizeof(keepalive_intvl)) < 0) {
+            std::cerr << "Warning: Failed to set TCP_KEEPINTVL" << std::endl;
+        }
+        
+        int keepalive_probes = 2; // Drop connection after 2 failed probes
+        if (setsockopt(clientSocketDescriptor, IPPROTO_TCP, TCP_KEEPCNT, &keepalive_probes, sizeof(keepalive_probes)) < 0) {
+            std::cerr << "Warning: Failed to set TCP_KEEPCNT" << std::endl;
+        }
+#endif
+
+#ifdef __APPLE__
+        // macOS-specific keepalive settings
+        int keepalive_time = 1; // Start sending keepalive probes after 1 second of idle
+        if (setsockopt(clientSocketDescriptor, IPPROTO_TCP, TCP_KEEPALIVE, &keepalive_time, sizeof(keepalive_time)) < 0) {
+            std::cerr << "Warning: Failed to set TCP_KEEPALIVE" << std::endl;
+        }
+#endif
+
         struct sockaddr_in relayServerAddress;
         std::memset(&relayServerAddress, 0, sizeof(relayServerAddress));
         relayServerAddress.sin_family = AF_INET;
@@ -368,87 +784,180 @@ int main() {
             throw std::runtime_error("Invalid IP address");
         }
 
+        // First connect in blocking mode
         if (connect(clientSocketDescriptor, (struct sockaddr*)&relayServerAddress, 
                    sizeof(relayServerAddress)) < 0) {
             close(clientSocketDescriptor);
             throw std::runtime_error("Failed to connect to relay server");
         }
 
+        // After successful connection, set to non-blocking mode
+        int flags = fcntl(clientSocketDescriptor, F_GETFL, 0);
+        if (flags < 0) {
+            std::cerr << "Warning: Failed to get socket flags" << std::endl;
+        } else if (fcntl(clientSocketDescriptor, F_SETFL, flags | O_NONBLOCK) < 0) {
+            std::cerr << "Warning: Failed to set socket to non-blocking mode" << std::endl;
+        }
+
         std::cout << "Connected to relay server at " << relayServerIP << ":" << RELAY_PORT << std::endl;
 
-        // Start receiving thread
+        // Start three threads: message receiver, connection manager, and message sender
         std::thread receiverThread(receiveMessages, clientSocketDescriptor, myKeyPair, friendPublicKey);
+        std::thread connectionThread(connectionManager, clientSocketDescriptor);
+        std::thread senderThread(messageSender, clientSocketDescriptor, myKeyPair, friendPublicKey);
+
+        // Disable terminal echo - we'll handle all output manually
+        newt.c_lflag &= ~(ECHO | ECHOE | ECHOK | ECHONL | ICANON);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
         // Main message loop
         std::string input;
+        char c;
+        
+        // Show initial prompt
+        displayPrompt("");
+        
         while (!shouldExit) {
-            std::cout << "You: ";
-            std::getline(std::cin, input);
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(STDIN_FILENO, &readfds);
             
-            if (input.empty()) continue;
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000; // 100ms timeout to check shouldExit flag more frequently
             
-            if (input[0] == '/') {
-                // Handle commands
-                if (input == "/exit") {
-                    shouldExit = true;
+            int activity = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv);
+            
+            if (activity < 0) {
+                if (errno != EINTR) {
+                    std::cerr << "\r\033[K\033[1;31mSelect error: " << strerror(errno) << "\033[0m" << std::endl;
+                }
+                // Check if we should exit on interrupt (might be our signal)
+                if (shouldExit) {
                     break;
-                } else if (input == "/history") {
-                    displayChatHistory(myKeyPair, friendPublicKey);
-                    continue;
-                } else if (input.substr(0, 5) == "/file ") {
-                    try {
-                        sendFile(clientSocketDescriptor, input.substr(6), myKeyPair, friendPublicKey);
-                    } catch (const std::exception& e) {
-                        std::cerr << "Error sending file: " << e.what() << std::endl;
-                    }
-                    continue;
                 }
+                continue;
             }
-
-            try {
-                EncryptedMessage encryptedMessage = encryptMessage(input, myKeyPair.privateKey, friendPublicKey);
-                TransferHeader header;
-                std::memset(&header, 0, sizeof(header));
-                strncpy(header.type, "MSG", sizeof(header.type));
-                header.dataSize = encryptedMessage.cipherTextLength + crypto_box_NONCEBYTES;
-
-                // Send header first
-                if (!sendAll(clientSocketDescriptor, &header, sizeof(header))) {
-                    throw std::runtime_error("Failed to send message header");
+            
+            // No activity, check if we should exit due to relay disconnection
+            if (activity == 0) {
+                if (shouldExit) {
+                    break;
                 }
+                continue;
+            }
+            
+            if (FD_ISSET(STDIN_FILENO, &readfds)) {
+                if (read(STDIN_FILENO, &c, 1) > 0) {
+                    if (c == '\n') {  // Enter key pressed
+                        {
+                            std::lock_guard<std::mutex> lock(inputMutex);
+                            input = currentInput;
+                            currentInput.clear();
+                        }
+                        
+                        // Clear the current line and move to beginning
+                        std::cout << "\r\033[K";
+                        
+                        if (input.empty()) {
+                            displayPrompt("");
+                            continue;
+                        }
+                        
+                        if (input[0] == '/') {
+                            // Handle commands
+                            if (input == "/exit") {
+                                shouldExit = true;
+                                break;
+                            } else if (input == "/history") {
+                                displayChatHistory(myKeyPair, friendPublicKey);
+                                displayPrompt("");
+                                continue;
+                            } else if (input.substr(0, 5) == "/file ") {
+                                try {
+                                    if (connectionLost) {
+                                        printSystemMessage("Cannot send file while connection is lost. Try again later.", true);
+                                        displayPrompt("");
+                                        continue;
+                                    }
+                                    sendFile(clientSocketDescriptor, input.substr(6), myKeyPair, friendPublicKey);
+                                } catch (const std::exception& e) {
+                                    std::cerr << "\033[1;31mError sending file: " << e.what() << "\033[0m" << std::endl;
+                                }
+                                displayPrompt("");
+                                continue;
+                            } else if (input == "/status") {
+                                // Add a status command to check connection
+                                if (connectionLost) {
+                                    printSystemMessage(inCountdownMode ? 
+                                        "Connection lost. Closing in " + std::to_string(countdownSeconds) + " seconds unless restored." :
+                                        "Connection lost. Waiting for reconnection.", true);
+                                } else {
+                                    printSystemMessage("Connected to relay server.");
+                                }
+                                displayPrompt("");
+                                continue;
+                            }
+                        }
 
-                // Send nonce
-                if (!sendAll(clientSocketDescriptor, encryptedMessage.nonce, crypto_box_NONCEBYTES)) {
-                    throw std::runtime_error("Failed to send message nonce");
+                        // Queue the message for sending
+                        {
+                            std::lock_guard<std::mutex> lock(queueMutex);
+                            messageQueue.push(input);
+                        }
+                        
+                        // If connection is lost, inform the user the message is queued
+                        if (connectionLost) {
+                            printSystemMessage("Message queued and will be sent when connection is restored.");
+                        }
+                        
+                        displayPrompt("");
+                    } 
+                    else if (c == 127 || c == '\b') {  // Backspace
+                        {
+                            std::lock_guard<std::mutex> lock(inputMutex);
+                            if (!currentInput.empty()) {
+                                currentInput.pop_back();
+                                displayPrompt(currentInput);
+                            }
+                        }
+                    } 
+                    else {
+                        {
+                            std::lock_guard<std::mutex> lock(inputMutex);
+                            currentInput += c;
+                            displayPrompt(currentInput);
+                        }
+                    }
                 }
-
-                // Send encrypted data
-                if (!sendAll(clientSocketDescriptor, encryptedMessage.cipherText.data(), 
-                            encryptedMessage.cipherTextLength)) {
-                    throw std::runtime_error("Failed to send message data");
-                }
-
-                // Flush the socket to ensure immediate delivery
-                int flag = 1;
-                if (setsockopt(clientSocketDescriptor, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
-                    std::cerr << "Warning: Failed to set TCP_NODELAY" << std::endl;
-                }
-
-                saveToChatHistory(input, myKeyPair, friendPublicKey, true);
-                std::cout << "Message sent successfully." << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "Error sending message: " << e.what() << std::endl;
             }
         }
+
+        std::cout << "\r\033[K\033[1;33mChat session ended. Goodbye!\033[0m" << std::endl;
+
+        // Restore terminal settings
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 
         // Cleanup
         if (receiverThread.joinable()) {
             receiverThread.join();
         }
+        if (connectionThread.joinable()) {
+            connectionThread.join();
+        }
+        if (senderThread.joinable()) {
+            senderThread.join();
+        }
         close(clientSocketDescriptor);
 
     } catch (const std::exception& e) {
-        std::cerr << "Fatal error: " << e.what() << std::endl;
+        // Restore terminal settings in case of error
+        struct termios oldt;
+        tcgetattr(STDIN_FILENO, &oldt);
+        oldt.c_lflag |= (ECHO | ECHOE | ECHOK | ECHONL | ICANON);
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        
+        std::cerr << "\033[1;31mFatal error: " << e.what() << "\033[0m" << std::endl;
         return 1;
     }
 
