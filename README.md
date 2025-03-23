@@ -91,11 +91,6 @@ This will create two executables:
 
 ## Chat Interface
 
--   Color-coded messages:
-    -   Your messages appear in cyan
-    -   Friend's messages appear in green
-    -   System messages appear in yellow/red
-    -   Timestamps appear in magenta
 -   Status indicators appear when connection issues are detected
 -   Countdown timer displays when connection is lost
 -   Messages are queued during disconnections and sent when connection is restored
