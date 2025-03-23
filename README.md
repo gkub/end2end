@@ -131,4 +131,4 @@ The application includes a sophisticated connection management system:
 
 ## Contributing
 
-Contributions are welcome! Feel free to fork the repository and submit pull requests.
+Feel free to fork the repository, no promises I will see/accept contributions but you are welcome to try.
